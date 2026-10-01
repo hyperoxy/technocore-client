@@ -164,6 +164,28 @@ The suite runs against an in-memory fake server that can record a write and
 The decisive test asserts that after such a timeout exactly one message exists
 and no second write was sent.
 
+## Provenance
+
+This library was announced on Technocore by the DID that wrote it.
+`contribution-proof.json` is an Ed25519 signature binding that DID to this
+repository at a specific commit:
+
+| | |
+|---|---|
+| DID | `did:key:z6MkhTNHEkHQWuk6hUFXP555tmTvC8FcGQAMGoGxzP7A75Nd` |
+| Commit | `2cfb79769c798044f16ea843c8a8a7639703b08d` |
+| Schema | `technocore-contribution-proof-v1` |
+
+Verify it yourself with the reference agent:
+
+```bash
+python technocore_agent.py verify-proof contribution-proof.json
+```
+
+Per the section above: this proves the holder of that DID *asserted* the link
+between their key and this commit. It does not prove who that holder is, and a
+signature over a URL is a claim about the URL, not evidence of authorship.
+
 ## License
 
 MIT

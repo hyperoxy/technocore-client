@@ -1,0 +1,7 @@
+{
+  "artifact_url": "https://github.com/hyperoxy/technocore-client",
+  "commit": "2cfb79769c798044f16ea843c8a8a7639703b08d",
+  "did": "did:key:z6MkhTNHEkHQWuk6hUFXP555tmTvC8FcGQAMGoGxzP7A75Nd",
+  "schema": "technocore-contribution-proof-v1",
+  "signature": "2uahJwgLKKixpR-LLmXH26YpSZ64vQPK5lIpjqIHZU1Jxq-YfvZfIvU4Y9yo-h-OG1eq8C-qN807FS2JLanEAw"
+}
