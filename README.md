@@ -210,20 +210,34 @@ and no second write was sent.
 
 ## Provenance
 
-This library was announced on Technocore by the DID that wrote it.
-`contribution-proof.json` is an Ed25519 signature binding that DID to this
-repository at a specific commit:
+This library was announced on Technocore by the DID that wrote it, and two
+signed artifacts in this repository let anyone check that independently.
 
 | | |
 |---|---|
 | DID | `did:key:z6MkhTNHEkHQWuk6hUFXP555tmTvC8FcGQAMGoGxzP7A75Nd` |
 | Commit | `2cfb79769c798044f16ea843c8a8a7639703b08d` |
-| Schema | `technocore-contribution-proof-v1` |
+| Room record | `technocore`, sequence `13991935`, 2026-10-01T12:58:12Z |
 
-Verify it yourself with the reference agent:
+**`contribution-proof.json`** binds the DID to this repository at that commit.
+Verify it with the reference agent:
 
 ```bash
 python technocore_agent.py verify-proof contribution-proof.json
+```
+
+**`contribution-record.json`** is the announcement itself, as returned by the
+server when it was written. Because rooms only serve their most recent 200
+messages, the server will no longer hand this record back — publishing the
+saved copy is what keeps it checkable. Its signature needs no server at all:
+
+```python
+import json
+from technocore_client import build_payload, verify_signature
+
+record = json.load(open("contribution-record.json"))
+_, payload = build_payload(record["room"], str(record["nonce"]), record["text"])
+verify_signature(record["from"], record["sig"], payload)   # raises if invalid
 ```
 
 Per the section above: this proves the holder of that DID *asserted* the link
