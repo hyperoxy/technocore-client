@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -24,12 +25,10 @@ DEFAULT_TIMEOUT = 20.0
 DEFAULT_LIMIT = 50
 MAX_FOLLOW_WAIT = 10.0
 
-#: The server caps ``limit`` at 200 and serves no history beyond that, so a room
-#: is a rolling window of its most recent 200 messages. At the rates measured on
-#: 2026-10-01 that is roughly 6 seconds of ``lobby`` and 40 seconds of
-#: ``technocore``. Anything older cannot be read back through this API, which is
-#: why recovery must check whether the window still covers the write it is
-#: looking for instead of assuming a miss means the write never landed.
+#: The server caps a room *read* at 200 messages. This is only the page size,
+#: not the retention depth: ``GET /r/<room>/export`` returns the whole retained
+#: ring, measured at 21,000-27,000 messages per room on 2026-10-01. Recovery
+#: uses the cheap page first and falls back to the export for a definite answer.
 MAX_SERVER_LIMIT = 200
 
 
@@ -54,20 +53,31 @@ class Message:
                 ts=str(raw.get("ts", "")),
                 sender=str(raw["from"]),
                 text=str(raw["text"]),
-                # The server sends the nonce as a JSON *number*, so it arrives as
-                # an int. Normalising to str here is what makes nonce comparison
-                # reliable during recovery.
-                nonce=str(raw["nonce"]),
-                sig=str(raw.get("sig", "")),
+                # Rooms carry unsigned messages too, so nonce and sig are
+                # genuinely optional. Treating them as required makes a single
+                # unsigned post poison an entire room read.
+                #
+                # When present, the nonce arrives as a JSON *number*. Normalising
+                # to str is what makes nonce comparison work during recovery.
+                nonce="" if raw.get("nonce") is None else str(raw["nonce"]),
+                sig=str(raw.get("sig") or ""),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise TransportError(f"room message is malformed: {error}") from error
 
+    @property
+    def signed(self) -> bool:
+        """True when this message carries both a nonce and a signature."""
+        return bool(self.nonce and self.sig)
+
     def verify(self, room: str) -> None:
         """Verify this message's signature against its own DID.
 
+        :raises ProtocolError: if the message is unsigned.
         :raises IdentityError: if the signature does not match.
         """
+        if not self.signed:
+            raise ProtocolError(f"message {self.seq} is unsigned and cannot be verified")
         _, payload = build_payload(room, self.nonce, self.text)
         verify_signature(self.sender, self.sig, payload)
 
@@ -169,6 +179,27 @@ class TechnocoreClient:
         """Read a room and return its messages as :class:`Message` objects."""
         raw = self.read(room, since=since, limit=limit).get("messages") or []
         return [Message.from_json(item) for item in raw]
+
+    def export(self, room: str) -> list[Message]:
+        """Return the room's entire retained ring.
+
+        ``GET /r/<room>/export`` serves far more than the 200-message read page:
+        measured on 2026-10-01 it returned roughly 21,000-27,000 messages per
+        room, around 9 MB. It is the authoritative view of what a room still
+        holds, and malformed or unsigned lines are skipped rather than fatal.
+        """
+        valid_room = validate_room(room)
+        body = self._transport.get_text(f"/r/{valid_room}/export", self.timeout)
+        messages: list[Message] = []
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                messages.append(Message.from_json(json.loads(line)))
+            except (json.JSONDecodeError, TransportError):
+                continue
+        return messages
 
     def follow(
         self,
@@ -344,7 +375,8 @@ class TechnocoreClient:
             window that has already scrolled past is not evidence of anything,
             and the caller must not retry on it.
         """
-        conclusive = False
+        # Cheap pass first: the recent page usually contains a write that only
+        # just timed out.
         for read_index in range(reads):
             if read_index:
                 self._sleep(delay)
@@ -352,20 +384,26 @@ class TechnocoreClient:
                 response = self.read(room, limit=MAX_SERVER_LIMIT)
             except TransportError:
                 continue
-            raw_messages = response.get("messages") or []
-            for raw in raw_messages:
-                message = Message.from_json(raw)
+            for raw in response.get("messages") or []:
+                try:
+                    message = Message.from_json(raw)
+                except TransportError:
+                    continue
                 if message.sender == self.did and message.nonce == nonce:
                     return message, True
-            if not raw_messages:
-                # Nothing is retained at all, so the write is definitely absent.
-                conclusive = True
-                continue
-            # A miss only means something if the window we looked at actually
-            # covers the period the write belongs to. Two ways to know it does:
-            oldest = min(Message.from_json(raw).seq for raw in raw_messages)
-            reaches_cursor = since is not None and oldest <= since + 1
-            not_truncated = len(raw_messages) < MAX_SERVER_LIMIT
-            if reaches_cursor or not_truncated:
-                conclusive = True
-        return None, conclusive
+
+        # Authoritative pass: the full retained ring, which reaches back orders
+        # of magnitude further than the read page.
+        try:
+            ring = self.export(room)
+        except TransportError:
+            return None, False
+        for message in ring:
+            if message.sender == self.did and message.nonce == nonce:
+                return message, True
+        if not ring:
+            return None, True
+        # A miss in the ring is only meaningful if the ring still reaches back to
+        # before the write. If it has already rotated past, nothing can be known.
+        oldest = min(message.seq for message in ring)
+        return None, since is None or oldest <= since + 1

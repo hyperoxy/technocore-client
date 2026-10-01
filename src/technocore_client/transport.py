@@ -21,6 +21,9 @@ from .errors import ProtocolError, TransportError, WriteTimeout
 __all__ = ["HttpTransport", "RetryPolicy", "Transport", "UrlLibTransport", "validate_base_url"]
 
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+#: A room export is the whole retained ring; measured at ~9 MB for a busy room
+#: on 2026-10-01, so this ceiling leaves generous headroom.
+MAX_EXPORT_BYTES = 64 * 1024 * 1024
 MAX_ERROR_BODY_BYTES = 16 * 1024
 USER_AGENT = "technocore-client/0.1.0"
 
@@ -55,6 +58,9 @@ class Transport(Protocol):
 
     def get(self, path: str, query: dict[str, Any], timeout: float) -> dict[str, Any]:
         """Perform a GET and return the decoded JSON object."""
+
+    def get_text(self, path: str, timeout: float) -> str:
+        """Perform a GET and return the raw body, for non-JSON endpoints."""
 
     def post_json(
         self, path: str, body: dict[str, Any], timeout: float
@@ -134,6 +140,30 @@ class UrlLibTransport:
                 last = error
                 self._retry.wait(attempt)
         raise last if last else TransportError("read failed")  # pragma: no cover
+
+    def get_text(self, path: str, timeout: float) -> str:
+        """Fetch a non-JSON body, used for the room export endpoint."""
+        request = Request(
+            f"{self.base_url}{path}",
+            method="GET",
+            headers={"Accept": "application/x-ndjson", "User-Agent": USER_AGENT},
+        )
+        last: TransportError | None = None
+        for attempt in range(1, self._retry.attempts + 1):
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    return response.read(MAX_EXPORT_BYTES + 1).decode("utf-8", "replace")
+            except HTTPError as error:
+                retryable = error.code >= 500 or error.code in {408, 429}
+                last = TransportError(
+                    f"Technocore returned HTTP {error.code}", retryable=retryable
+                )
+            except (socket.timeout, URLError) as error:
+                last = TransportError(f"export failed: {error}", retryable=True)
+            if not last.retryable or attempt == self._retry.attempts:
+                raise last
+            self._retry.wait(attempt)
+        raise last  # pragma: no cover
 
     def post_json(
         self, path: str, body: dict[str, Any], timeout: float

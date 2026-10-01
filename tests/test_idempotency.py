@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from technocore_client import TechnocoreClient, UnresolvedWrite
+from technocore_client import ProtocolError, TechnocoreClient, UnresolvedWrite
 
 
 def make_client(identity, server) -> TechnocoreClient:
@@ -122,14 +122,15 @@ def test_posted_message_verifies_against_its_own_did(identity, server):
 def test_scrolled_window_is_reported_unknown_rather_than_retried(identity, server):
     """The failure mode this library would otherwise create itself.
 
-    The write landed, the response was lost, and by the time recovery reads the
-    room the readable window has scrolled past it. A miss here proves nothing,
-    so retrying would duplicate the message under the author's DID.
+    The write landed, the response was lost, and by the time recovery looks,
+    the whole retained ring has rotated past it -- not just the 200-message read
+    page, but the export too. A miss here proves nothing, so retrying would
+    duplicate the message under the author's DID.
+
+    The real ring held 21,000-27,000 messages on 2026-10-01, so this needs a
+    long outage to happen. It is modelled small here because the consequence of
+    getting it wrong is permanent.
     """
-    # Faithful to the real server: a 200-message ceiling, and enough traffic
-    # between reads to roll the whole window over. Measured on 2026-10-01,
-    # lobby runs at ~30 messages/second, so 200 messages is ~6 seconds -- less
-    # than the default write timeout.
     server.window = 200
     server.noise_per_read = 250
     server.timeout_writes = {1}
@@ -164,3 +165,35 @@ def test_read_limit_above_the_server_cap_is_rejected(identity, server):
 
     with pytest.raises(ProtocolError):
         make_client(identity, server).read("lobby", limit=1000)
+
+
+def test_unsigned_messages_do_not_break_a_room_read(identity, server):
+    """Real rooms carry unsigned posts; one must not poison the whole read."""
+    from technocore_client.client import Message
+
+    server.messages.append(
+        {"seq": 1, "ts": "", "from": "did:key:z6MkPLAIN", "text": "no signature here"}
+    )
+    make_client(identity, server).say("lobby", "hello")
+
+    msgs = make_client(identity, server).messages("lobby", limit=50)
+    unsigned = [m for m in msgs if not m.signed]
+
+    assert len(unsigned) == 1
+    with pytest.raises(ProtocolError):
+        unsigned[0].verify("lobby")
+    assert [m for m in msgs if m.signed]
+
+
+def test_recovery_falls_back_to_the_export_ring(identity, server):
+    """The write is past the 200-message page but still inside the ring."""
+    server.timeout_writes = {1}
+    server.noise_per_read = 250
+    server.window = 100_000
+    client = make_client(identity, server)
+
+    result = client.say("lobby", "hello")
+
+    assert result.recovered is True
+    assert server.write_attempts == 1
+    assert len([m for m in server.messages if m["from"] == identity.did]) == 1

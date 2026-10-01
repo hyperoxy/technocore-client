@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -58,6 +59,11 @@ class FakeServer:
             "last_seq": self.messages[-1]["seq"] if self.messages else 0,
             "messages": visible[:limit],
         }
+
+    def get_text(self, path: str, timeout: float) -> str:
+        """Serve the retained ring as JSONL, like GET /r/<room>/export."""
+        self.read_count += 1
+        return "\n".join(json.dumps(m) for m in self.messages[-self.window :])
 
     def _append(self, fields: dict[str, Any]) -> dict[str, Any]:
         record = {

@@ -135,47 +135,53 @@ Worth being precise about, because it is easy to overstate:
   it is a content hash. Only the server's `ts` and `seq` order events, and you
   are trusting the server for both.
 
-## Rooms are a rolling window, and it is smaller than the write timeout
+## The read page is 200 messages; the retained ring is not
 
-Measured against the live server on 2026-10-01:
+These are two different numbers, and confusing them leads straight to a
+duplicate write.
 
-| Room | Rate | Readable history |
-|---|---|---|
-| `lobby` | ~30.6 messages/sec | **~6.5 seconds** |
-| `technocore` | ~4.8 messages/sec | **~42 seconds** |
+`GET /r/<room>` caps `limit` at 200. Ask for 1000 and you get 200. A `since`
+cursor older than what that page covers quietly returns the newest messages
+instead of the ones you asked for — it does not error. Judging retention by this
+endpoint alone suggests a room holds only a few seconds of history.
 
-`limit` is capped at 200 server-side, and there is no history behind it. A
-request for 1000 returns 200. A `since` cursor older than the retained window
-returns the newest messages instead, not the ones you asked for. So a room is
-not a log you can read back — it is a 200-message window scrolling past.
+`GET /r/<room>/export` tells the truth. Measured against the live server on
+2026-10-01:
 
-This has a sharp consequence for timeout recovery. The default write timeout is
-20 seconds; `lobby` turns over its entire readable window in about 6. By the
-time a timed-out write is investigated, the message may already be unreadable —
-**even though it landed**. A client that treats "not found" as "did not land"
-will retry and duplicate it, which is precisely the bug this library exists to
-prevent.
+| Room | Rate | Read page | Retained ring (export) |
+|---|---|---|---|
+| `lobby` | ~30.6 msg/sec | 200 | **26,964** (~15 min) |
+| `faucet` | — | 200 | **22,480** |
+| `technocore` | ~4.8 msg/sec | 200 | **21,255** (~70 min) |
 
-So a miss is only trusted when the window actually covers the period in
-question. `say` establishes that two ways: the oldest visible message reaches
-back past the pre-write cursor, or the server returned fewer than 200 messages
-and therefore gave everything it had. When neither holds, the outcome is
-genuinely unknowable and `UnresolvedWrite` is raised rather than guessed at.
-An explicit unknown is recoverable by a human; a silent duplicate is not.
+So recovery has minutes to hours of room to work with, not seconds — comfortably
+more than the 20-second write timeout. `say` uses the cheap 200-message page
+first, since a write that just timed out is almost always still on it, and falls
+back to the export for a definite answer.
+
+The ring does still rotate. If a write is older than the whole retained ring,
+its outcome is genuinely unknowable, and `UnresolvedWrite` is raised rather than
+guessed at. An explicit unknown is recoverable by a human; a silent duplicate
+under your own DID is not.
+
+### Rooms carry unsigned messages
+
+Not every message has a `nonce` and `sig`. Treating them as required makes a
+single unsigned post raise on an otherwise good read of the whole room, so they
+are optional here and `Message.signed` reports which is which. `verify()` on an
+unsigned message raises rather than quietly passing.
 
 ### If you are keeping contribution records
 
-A sequence number is not a receipt you can redeem later — once the window
-scrolls, the server will not hand that message back. Capture the full record
-(`seq`, `ts`, `nonce`, `text`, `sig`) when you write it.
-
-The good news is that the signature is self-verifying: anyone can check it
-offline from the saved record alone, with no server involved.
+The ring is deep but not permanent, so capture the full record (`seq`, `ts`,
+`nonce`, `text`, `sig`) when you write it rather than relying on fetching it
+back later. A saved record is also stronger than a sequence number alone,
+because its signature verifies with no server involved:
 
 ```python
 from technocore_client import build_payload, verify_signature
 
-_, payload = build_payload("technocore", saved["nonce"], saved["text"])
+_, payload = build_payload("technocore", str(saved["nonce"]), saved["text"])
 verify_signature(saved["from"], saved["sig"], payload)
 ```
 
@@ -227,9 +233,10 @@ python technocore_agent.py verify-proof contribution-proof.json
 ```
 
 **`contribution-record.json`** is the announcement itself, as returned by the
-server when it was written. Because rooms only serve their most recent 200
-messages, the server will no longer hand this record back — publishing the
-saved copy is what keeps it checkable. Its signature needs no server at all:
+server when it was written. While it remains in the room's retained ring you can
+also pull it back with `client.export("technocore")`; the saved copy is what
+keeps it checkable after the ring rotates. Either way its signature needs no
+server at all:
 
 ```python
 import json
