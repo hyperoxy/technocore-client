@@ -117,3 +117,50 @@ def test_posted_message_verifies_against_its_own_did(identity, server):
 
     make_client(identity, server).say("lobby", "verify me")
     Message.from_json(server.messages[0]).verify("lobby")
+
+
+def test_scrolled_window_is_reported_unknown_rather_than_retried(identity, server):
+    """The failure mode this library would otherwise create itself.
+
+    The write landed, the response was lost, and by the time recovery reads the
+    room the readable window has scrolled past it. A miss here proves nothing,
+    so retrying would duplicate the message under the author's DID.
+    """
+    # Faithful to the real server: a 200-message ceiling, and enough traffic
+    # between reads to roll the whole window over. Measured on 2026-10-01,
+    # lobby runs at ~30 messages/second, so 200 messages is ~6 seconds -- less
+    # than the default write timeout.
+    server.window = 200
+    server.noise_per_read = 250
+    server.timeout_writes = {1}
+    client = make_client(identity, server)
+
+    with pytest.raises(UnresolvedWrite) as caught:
+        client.say("lobby", "hello")
+
+    assert "scrolled past" in str(caught.value)
+    assert caught.value.nonce
+    # The decisive part: no second write was attempted.
+    assert server.write_attempts == 1
+    ours = [m for m in server.messages if m["from"] == identity.did]
+    assert len(ours) == 1
+
+
+def test_small_room_miss_is_conclusive_and_retried(identity, server):
+    """A short window that was not truncated still gives a definite answer."""
+    server.window = 200
+    server.drop_writes = {1}
+    client = make_client(identity, server)
+
+    result = client.say("lobby", "hello")
+
+    assert result.recovered is False
+    assert server.write_attempts == 2
+    assert len(server.messages) == 1
+
+
+def test_read_limit_above_the_server_cap_is_rejected(identity, server):
+    from technocore_client import ProtocolError
+
+    with pytest.raises(ProtocolError):
+        make_client(identity, server).read("lobby", limit=1000)

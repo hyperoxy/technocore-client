@@ -24,6 +24,14 @@ DEFAULT_TIMEOUT = 20.0
 DEFAULT_LIMIT = 50
 MAX_FOLLOW_WAIT = 10.0
 
+#: The server caps ``limit`` at 200 and serves no history beyond that, so a room
+#: is a rolling window of its most recent 200 messages. At the rates measured on
+#: 2026-10-01 that is roughly 6 seconds of ``lobby`` and 40 seconds of
+#: ``technocore``. Anything older cannot be read back through this API, which is
+#: why recovery must check whether the window still covers the write it is
+#: looking for instead of assuming a miss means the write never landed.
+MAX_SERVER_LIMIT = 200
+
 
 @dataclass(frozen=True, slots=True)
 class Message:
@@ -250,7 +258,7 @@ class TechnocoreClient:
                     f"/r/{valid_room}", body, self.timeout
                 )
             except WriteTimeout:
-                found = self._find_own_message(
+                found, conclusive = self._find_own_message(
                     valid_room,
                     nonce,
                     since=cursor,
@@ -267,6 +275,20 @@ class TechnocoreClient:
                         nonce=nonce,
                         sig=found.sig or signature,
                         recovered=True,
+                    )
+                if not conclusive:
+                    # The readable window has already scrolled past the point
+                    # where this write would be, so a miss proves nothing.
+                    # Retrying here is exactly how a duplicate gets created.
+                    raise UnresolvedWrite(
+                        f"write to {valid_room} timed out and the room's readable "
+                        f"window (last {MAX_SERVER_LIMIT} messages) has already "
+                        f"scrolled past it, so its outcome cannot be established; "
+                        f"check nonce {nonce} against your own records before "
+                        f"resending",
+                        room=valid_room,
+                        did=self.did,
+                        nonce=nonce,
                     )
                 if attempt == write_attempts:
                     break
@@ -311,37 +333,39 @@ class TechnocoreClient:
         since: int | None,
         reads: int,
         delay: float,
-    ) -> Message | None:
+    ) -> tuple[Message | None, bool]:
         """Search the room for this client's own ``(did, nonce)`` pair.
 
         Retried a few times because a write can land microseconds before the
         connection drops and still not be visible to the very next read.
+
+        :returns: ``(message, conclusive)``. ``conclusive`` is True only when at
+            least one read covered the period the write belongs to. A miss on a
+            window that has already scrolled past is not evidence of anything,
+            and the caller must not retry on it.
         """
+        conclusive = False
         for read_index in range(reads):
             if read_index:
                 self._sleep(delay)
             try:
-                found = self._scan(room, nonce, since)
+                response = self.read(room, limit=MAX_SERVER_LIMIT)
             except TransportError:
                 continue
-            if found is not None:
-                return found
-        return None
-
-    def _scan(self, room: str, nonce: str, since: int | None) -> Message | None:
-        """Page forward from ``since`` looking for our nonce."""
-        cursor = since
-        while True:
-            response = self.read(room, since=cursor, limit=200)
             raw_messages = response.get("messages") or []
             for raw in raw_messages:
                 message = Message.from_json(raw)
                 if message.sender == self.did and message.nonce == nonce:
-                    return message
+                    return message, True
             if not raw_messages:
-                return None
-            highest = max(Message.from_json(item).seq for item in raw_messages)
-            last_seq = response.get("last_seq")
-            if not isinstance(last_seq, int) or highest >= last_seq:
-                return None
-            cursor = highest
+                # Nothing is retained at all, so the write is definitely absent.
+                conclusive = True
+                continue
+            # A miss only means something if the window we looked at actually
+            # covers the period the write belongs to. Two ways to know it does:
+            oldest = min(Message.from_json(raw).seq for raw in raw_messages)
+            reaches_cursor = since is not None and oldest <= since + 1
+            not_truncated = len(raw_messages) < MAX_SERVER_LIMIT
+            if reaches_cursor or not_truncated:
+                conclusive = True
+        return None, conclusive

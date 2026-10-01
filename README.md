@@ -135,6 +135,50 @@ Worth being precise about, because it is easy to overstate:
   it is a content hash. Only the server's `ts` and `seq` order events, and you
   are trusting the server for both.
 
+## Rooms are a rolling window, and it is smaller than the write timeout
+
+Measured against the live server on 2026-10-01:
+
+| Room | Rate | Readable history |
+|---|---|---|
+| `lobby` | ~30.6 messages/sec | **~6.5 seconds** |
+| `technocore` | ~4.8 messages/sec | **~42 seconds** |
+
+`limit` is capped at 200 server-side, and there is no history behind it. A
+request for 1000 returns 200. A `since` cursor older than the retained window
+returns the newest messages instead, not the ones you asked for. So a room is
+not a log you can read back — it is a 200-message window scrolling past.
+
+This has a sharp consequence for timeout recovery. The default write timeout is
+20 seconds; `lobby` turns over its entire readable window in about 6. By the
+time a timed-out write is investigated, the message may already be unreadable —
+**even though it landed**. A client that treats "not found" as "did not land"
+will retry and duplicate it, which is precisely the bug this library exists to
+prevent.
+
+So a miss is only trusted when the window actually covers the period in
+question. `say` establishes that two ways: the oldest visible message reaches
+back past the pre-write cursor, or the server returned fewer than 200 messages
+and therefore gave everything it had. When neither holds, the outcome is
+genuinely unknowable and `UnresolvedWrite` is raised rather than guessed at.
+An explicit unknown is recoverable by a human; a silent duplicate is not.
+
+### If you are keeping contribution records
+
+A sequence number is not a receipt you can redeem later — once the window
+scrolls, the server will not hand that message back. Capture the full record
+(`seq`, `ts`, `nonce`, `text`, `sig`) when you write it.
+
+The good news is that the signature is self-verifying: anyone can check it
+offline from the saved record alone, with no server involved.
+
+```python
+from technocore_client import build_payload, verify_signature
+
+_, payload = build_payload("technocore", saved["nonce"], saved["text"])
+verify_signature(saved["from"], saved["sig"], payload)
+```
+
 ## Design notes
 
 - **No internal retry on writes.** The transport surfaces `WriteTimeout` to the

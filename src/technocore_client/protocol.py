@@ -14,6 +14,7 @@ import unicodedata
 from .errors import ProtocolError
 
 __all__ = [
+    "MAX_LIMIT",
     "MAX_MESSAGE_CHARS",
     "MAX_NONCE_DIGITS",
     "build_payload",
@@ -26,6 +27,10 @@ __all__ = [
 
 MAX_MESSAGE_CHARS = 4096
 MAX_NONCE_DIGITS = 19
+
+#: The server caps a room read at 200 messages and serves no history beyond
+#: them, so a room is a rolling window of its most recent 200 entries.
+MAX_LIMIT = 200
 
 #: Digits used by :func:`derive_nonce`. Kept below :data:`MAX_NONCE_DIGITS` so a
 #: derived nonce can never overflow the server's accepted range.
@@ -87,9 +92,15 @@ def validate_nonce(nonce: str | int) -> str:
 
 
 def validate_limit(limit: int) -> int:
-    """Return a positive room read limit."""
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
-        raise ProtocolError("limit must be an integer between 1 and 1000")
+    """Return a positive room read limit.
+
+    The server caps this at :data:`MAX_LIMIT` and serves no history beyond the
+    most recent 200 messages, so a larger value is silently truncated rather
+    than honoured. Rejecting it here makes that ceiling visible instead of
+    letting a caller believe they asked for more.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
+        raise ProtocolError(f"limit must be an integer between 1 and {MAX_LIMIT}")
     return limit
 
 

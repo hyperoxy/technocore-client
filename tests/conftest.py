@@ -27,21 +27,47 @@ class FakeServer:
         self.drop_writes: set[int] = set()
         self.write_attempts = 0
         self.read_count = 0
+        #: Only the most recent ``window`` messages are readable, mirroring the
+        #: real server's 200-message ceiling with no history behind it.
+        self.window = 200
+        #: Filler messages appended on every read, to simulate a busy room
+        #: scrolling the window forward underneath the client.
+        self.noise_per_read = 0
 
     # -- transport surface -------------------------------------------------
 
     def get(self, path: str, query: dict[str, Any], timeout: float) -> dict[str, Any]:
         self.read_count += 1
         room = path.rsplit("/", 1)[-1]
+        for _ in range(self.noise_per_read):
+            self._append(
+                {
+                    "from": "did:key:z6MkNOISE",
+                    "text": "filler",
+                    "nonce": self.next_seq,
+                    "sig": "n" * 86,
+                }
+            )
         since = query.get("since")
-        limit = int(query.get("limit", 50))
-        visible = [m for m in self.messages if since is None or m["seq"] > int(since)]
+        limit = min(int(query.get("limit", 50)), 200)
+        retained = self.messages[-self.window :]
+        visible = [m for m in retained if since is None or m["seq"] > int(since)]
         return {
             "room": room,
             "count": len(self.messages),
             "last_seq": self.messages[-1]["seq"] if self.messages else 0,
             "messages": visible[:limit],
         }
+
+    def _append(self, fields: dict[str, Any]) -> dict[str, Any]:
+        record = {
+            "seq": self.next_seq,
+            "ts": "2026-10-01T00:00:00.000000Z",
+            **fields,
+        }
+        self.messages.append(record)
+        self.next_seq += 1
+        return record
 
     def post_json(self, path: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
         self.write_attempts += 1
